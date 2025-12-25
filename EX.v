@@ -10,10 +10,13 @@ module EX(
     output wire [`EX_TO_MEM_WD-1:0] ex_to_mem_bus, 
     output wire [37:0] ex_to_id_bus, 
 
+    // ------ 恢复：SRAM 接口 ------
     output wire data_sram_en,       
     output wire [3:0] data_sram_wen,
     output wire [31:0] data_sram_addr, 
     output wire [31:0] data_sram_wdata,
+    
+    // ------ 恢复：Load 标记 (给 ID 用) ------
     output wire inst_is_load,       
     
     output wire stallreq_for_ex,    
@@ -81,7 +84,10 @@ module EX(
     
     assign w_lo_we3 = 1'b0; 
     assign w_hi_we3 = 1'b0; 
-    assign inst_is_load = 1'b0; 
+    
+    // --- 恢复：Load 指令判断逻辑 ---
+    // LW 的 opcode 是 100011 (0x23)
+    assign inst_is_load = (inst[31:26] == 6'b10_0011) ? 1'b1 : 1'b0;
     
     wire [31:0] imm_sign_extend, imm_zero_extend, sa_zero_extend;
     assign imm_sign_extend = {{16{inst[15]}},inst[15:0]}; 
@@ -91,7 +97,8 @@ module EX(
     wire [31:0] alu_src1, alu_src2; 
     wire [31:0] alu_result, ex_result; 
 
-    // --- ALU 输入选择逻辑 ---
+    // --- 恢复：ALU 输入选择逻辑 ---
+    // 确保支持 Link 指令 (PC+8) 和 移位指令 (sa)
     assign alu_src1 = sel_alu_src1[1] ? ex_pc :           
                       sel_alu_src1[2] ? sa_zero_extend :  
                       rf_rdata1;                          
@@ -108,12 +115,19 @@ module EX(
         .alu_result  (alu_result  )  
     );
 
+    // Passpoint 36 只要 ALU 结果 (包含访存地址计算结果)
     assign ex_result = alu_result;
 
-    assign data_sram_en = 1'b0; 
-    assign data_sram_wen = 4'b0000;
-    assign data_sram_addr = ex_result ; 
-    assign data_sram_wdata = 32'b0;
+    // --- 恢复：SRAM 接口控制 ---
+    assign data_sram_en = data_ram_en; 
+    
+    // 简单恢复 SW 的写逻辑 (全写)
+    // Passpoint 36 暂时不测 SB/SH，所以如果是写指令，直接给 4'b1111 即可
+    // 如果后续需要支持 SB/SH，这里需要恢复移位掩码逻辑
+    assign data_sram_wen = data_ram_wen; // ID 阶段对 SW 已经给出了 1111
+
+    assign data_sram_addr = ex_result; // ALU 计算出的地址
+    assign data_sram_wdata = rf_rdata2; // SW 写入的数据是 rt (未处理对齐，SW 不需要)
 
     assign ex_to_mem_bus = {
         ex_pc,          
@@ -132,6 +146,7 @@ module EX(
         ex_result       
     };
     
+    // --- 保持屏蔽：乘除法 ---
     wire w_hi_we1, w_lo_we1, w_hi_we2, w_lo_we2;
 
     assign w_hi_we1 = 1'b0; 
