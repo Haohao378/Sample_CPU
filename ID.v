@@ -172,10 +172,9 @@ module ID(
     assign sel = inst[2:0];      
 
     // =========================================================================
-    // 3. Load-Use 冒险检测 (Passpoint 36 核心功能)
+    // 3. Load-Use 冒险检测 (核心功能)
     // =========================================================================
-    // 如果上一条指令是 Load (inst_is_load=1)，且它的目标寄存器 (ex_to_id_bus[36:32])
-    // 等于当前指令的源寄存器 (rs 或 rt)，则必须暂停。
+    // 暂停条件：上一条是 Load，且 Load 的目标 (rt) 与当前指令的源操作数 (rs 或 rt) 冲突
     assign stallreq_for_id = (inst_is_load == 1'b1 && (rs == ex_to_id_bus[36:32] || rt == ex_to_id_bus[36:32] ));
 
     // --- 译码器实例化 ---
@@ -195,7 +194,7 @@ module ID(
     wire op_and, op_nor, op_or, op_xor;
     wire op_sll, op_srl, op_sra, op_lui;
 
-    // --- 指令判断逻辑 (Passpoint 36 恢复所有基础 ALU 和 LW/SW) ---
+    // --- 指令判断逻辑 (Passpoint 37-43: 确保分支跳转指令有效) ---
     assign inst_ori     = op_d[6'b00_1101];
     assign inst_lui     = op_d[6'b00_1111];
     assign inst_addiu   = op_d[6'b00_1001];
@@ -208,11 +207,9 @@ module ID(
     assign inst_bne     = op_d[6'b00_0101];
     assign inst_or      = op_d[6'b00_0000] & (sa==5'b0_0000) & func_d[6'b10_0101];
 
-    // --- 恢复：Load/Store ---
     assign inst_lw      = op_d[6'b10_0011]; 
     assign inst_sw      = op_d[6'b10_1011]; 
     
-    // --- 恢复：完整逻辑运算和移位 ---
     assign inst_xor     = op_d[6'b00_0000] & (sa==5'b0_0000) & func_d[6'b10_0110];
     assign inst_sltu    = op_d[6'b00_0000] & (sa==5'b0_0000) & func_d[6'b10_1011];
     assign inst_slt     = op_d[6'b00_0000] & (sa==5'b0_0000) & func_d[6'b10_1010];
@@ -232,16 +229,21 @@ module ID(
     assign inst_srl     = op_d[6'b00_0000] & (rs==5'b0_0000) & func_d[6'b00_0010];
     assign inst_srlv    = op_d[6'b00_0000] & (sa==5'b0_0000) & func_d[6'b00_0110];
     
-    // 分支
+    // --- 扩展分支指令 (Passpoint 37-43) ---
+    // REGIMM 指令 (Opcode=1)，根据 rt 区分
     assign inst_bgez    = op_d[6'b00_0001] & (rt==5'b0_0001); 
     assign inst_bltz    = op_d[6'b00_0001] & (rt==5'b0_0000);
-    assign inst_bgtz    = op_d[6'b00_0111] & (rt==5'b0_0000);
-    assign inst_blez    = op_d[6'b00_0110] & (rt==5'b0_0000);
     assign inst_bgezal  = op_d[6'b00_0001] & (rt==5'b1_0001);
     assign inst_bltzal  = op_d[6'b00_0001] & (rt==5'b1_0000);
+    
+    // 其他分支
+    assign inst_bgtz    = op_d[6'b00_0111] & (rt==5'b0_0000);
+    assign inst_blez    = op_d[6'b00_0110] & (rt==5'b0_0000);
+    
+    // JALR: Special + Func=9. 
     assign inst_jalr    = op_d[6'b00_0000] & (rt==5'b0_0000) & (sa==5'b0_0000) & func_d[6'b00_1001];
 
-    // Passpoint 36 仍屏蔽乘除法/字节访问
+    // Passpoint 44+ (乘除法) 仍屏蔽
     assign inst_mflo    = 1'b0; 
     assign inst_mfhi    = 1'b0; 
     assign inst_mthi    = 1'b0; 
@@ -260,26 +262,25 @@ module ID(
 
     assign inst_lsa     = 1'b0; 
 
-    // --- ALU 输入选择 (恢复 LW/SW 的源选择) ---
-    // sel_alu_src1[0]: rs
+    // --- ALU 输入选择 ---
+    // sel_alu_src1[1]: 选择 PC (用于 Link 指令计算 PC+8)
     assign sel_alu_src1[0] = inst_ori | inst_addiu | inst_subu | inst_addu | inst_or | inst_lw | inst_sw | inst_xor | inst_sltu | inst_slt
                                 | inst_slti | inst_sltiu | inst_add | inst_addi | inst_sub | inst_and | inst_andi | inst_nor | inst_xori
                                 | inst_sllv | inst_srav | inst_srlv;
     assign sel_alu_src1[1] = inst_jal | inst_bgezal |inst_bltzal | inst_jalr;
     assign sel_alu_src1[2] = inst_sll | inst_sra | inst_srl;
 
-    // sel_alu_src2[0]: rt
+    // sel_alu_src2[2]: 选择 8 (用于 Link 指令计算 PC+8)
     assign sel_alu_src2[0] = inst_subu | inst_addu | inst_sll | inst_or | inst_xor | inst_sltu | inst_slt | inst_add | inst_sub | inst_and |
                               inst_nor | inst_sllv | inst_sra | inst_srav | inst_srl | inst_srlv;
-    // sel_alu_src2[1]: 立即数符号扩展 (LW/SW 需要!)
     assign sel_alu_src2[1] = inst_lui | inst_addiu | inst_lw | inst_sw | inst_slti | inst_sltiu | inst_addi;
-    
     assign sel_alu_src2[2] = inst_jal | inst_bgezal | inst_bltzal | inst_jalr;
     assign sel_alu_src2[3] = inst_ori | inst_andi | inst_xori;
 
     assign lo_hi_r = 2'b00;
 
-    // --- ALU Opcode (恢复加法用于 LW/SW) ---
+    // --- ALU Opcode ---
+    // op_add 需要包含 Link 指令 (计算 PC+8)
     assign op_add = inst_addiu | inst_jal | inst_addu | inst_lw | inst_sw | inst_add | inst_addi | inst_bgezal | inst_bltzal | inst_jalr;
     assign op_sub = inst_subu | inst_sub;
     assign op_slt = inst_slt | inst_slti;
@@ -297,24 +298,25 @@ module ID(
                      op_and, op_nor, op_or, op_xor,
                      op_sll, op_srl, op_sra, op_lui};
 
-    // --- 恢复：Data RAM Enable (LW/SW) ---
+    // --- RAM 使能 ---
     assign data_ram_en = inst_lw | inst_sw;
     assign data_ram_wen = inst_sw ? 4'b1111 : 4'b0000;
-    
-    // --- 恢复：读模式 (LW) ---
     assign data_ram_read = inst_lw ? 4'b1111 : 4'b0000;
 
-    // --- 寄存器写控制 (恢复 LW 写回) ---
+    // --- 寄存器写使能 (必须包含链接指令) ---
     assign rf_we = inst_ori | inst_lui | inst_addiu | inst_subu | inst_jal |inst_addu | inst_sll | inst_or | inst_xor | inst_lw | inst_sltu
       | inst_slt | inst_slti | inst_sltiu | inst_add | inst_addi | inst_sub | inst_and | inst_andi | inst_nor | inst_sllv | inst_xori | inst_sra
       | inst_srav | inst_srl | inst_srlv | inst_bgezal | inst_bltzal | inst_jalr;
 
+    // --- 写目标选择 ---
+    // dst[0]: 写 rd (包含 JALR)
     assign sel_rf_dst[0] = inst_subu | inst_addu | inst_sll | inst_or | inst_xor | inst_sltu | inst_slt | inst_add | inst_sub | inst_and | inst_nor
                              | inst_sllv | inst_sra | inst_srav | inst_srl | inst_srlv | inst_jalr;
     
-    // LW 也是写 rt
+    // dst[1]: 写 rt
     assign sel_rf_dst[1] = inst_ori | inst_lui | inst_addiu | inst_lw | inst_slti | inst_sltiu | inst_addi | inst_andi | inst_xori;
     
+    // dst[2]: 写 31 (ra) (包含 JAL, BGEZAL, BLTZAL)
     assign sel_rf_dst[2] = inst_jal | inst_bgezal | inst_bltzal;
 
     assign lo_hi_w = 2'b00;
@@ -323,7 +325,6 @@ module ID(
                     | {5{sel_rf_dst[1]}} & rt
                     | {5{sel_rf_dst[2]}} & 32'd31;
 
-    // --- 恢复：写回数据来源 (1 代表来自 Load) ---
     assign sel_rf_res = inst_lw ? 1'b1 : 1'b0;
 
     // --- ID 到 EX 总线打包 ---
@@ -347,7 +348,7 @@ module ID(
         data_ram_read   
     };
 
-    // --- 分支跳转逻辑 (不变) ---
+    // --- 分支跳转逻辑 (核心修正) ---
     wire br_e;              
     wire [31:0] br_addr;    
     wire rs_eq_rt;          
@@ -362,15 +363,26 @@ module ID(
 
     assign rs_eq_rt = (rdata1 == rdata2);           
     assign re_bne_rt = (rdata1 != rdata2);          
-    assign re_bgez_rt = (rdata1[31] == 1'b0);       
-    assign re_bltz_rt = (rdata1[31] == 1'b1);       
-    assign re_blez_rt = (rdata1[31] == 1'b1 || rdata1 == 32'b0); 
-    assign re_bgtz_rt = (rdata1[31] == 1'b0 && rdata1 != 32'b0); 
+    assign re_bgez_rt = (rdata1[31] == 1'b0);       // >= 0: 符号位为0
+    assign re_bltz_rt = (rdata1[31] == 1'b1);       // < 0: 符号位为1
+    assign re_blez_rt = (rdata1[31] == 1'b1 || rdata1 == 32'b0); // <= 0: 负数或0
+    assign re_bgtz_rt = (rdata1[31] == 1'b0 && rdata1 != 32'b0); // > 0: 正数且非0
 
-    assign br_e = (inst_beq && rs_eq_rt) | inst_jr | inst_jal | (inst_bne && re_bne_rt) | inst_j |(inst_bgez && re_bgez_rt)
-                  | (inst_bltz && re_bltz_rt) |(inst_bgtz && re_bgtz_rt) | (inst_blez && re_blez_rt) | (inst_bgezal && re_bgez_rt)
-                  | (inst_bltzal && re_bltz_rt) | inst_jalr;
+    // 分支使能：组合所有分支条件
+    assign br_e = (inst_beq && rs_eq_rt) 
+                | inst_jr 
+                | inst_jal 
+                | (inst_bne && re_bne_rt) 
+                | inst_j 
+                | (inst_bgez && re_bgez_rt)
+                | (inst_bltz && re_bltz_rt) 
+                | (inst_bgtz && re_bgtz_rt) 
+                | (inst_blez && re_blez_rt) 
+                | (inst_bgezal && re_bgez_rt)
+                | (inst_bltzal && re_bltz_rt) 
+                | inst_jalr;
 
+    // 跳转地址计算
     assign br_addr = inst_beq ? (pc_plus_4 + {{14{inst[15]}},inst[15:0],2'b0}) : 
     inst_jr ? (rdata1) :                                                          
     inst_jal ? ({pc_plus_4[31:28],inst[25:0],2'b0}):                              
@@ -382,7 +394,7 @@ module ID(
     inst_bgezal ? (pc_plus_4 + {{14{inst[15]}},inst[15:0],2'b0}) :                
     inst_bltzal ? (pc_plus_4 + {{14{inst[15]}},inst[15:0],2'b0}) :                
     inst_j   ?  ({pc_plus_4[31:28],inst[25:0],2'b0}):                             
-    inst_jalr ? (rdata1) :                                                        
+    inst_jalr ? (rdata1) : // JALR 跳转到 rs (rdata1)                                                        
     32'b0;
 
     assign br_bus = {
