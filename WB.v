@@ -52,11 +52,12 @@ module WB(
         rf_wdata        
     } = mem_to_wb_bus_r;
     
-    assign w_hi_we = 1'b0;
-    assign w_lo_we = 1'b0;
-    assign hi_i = 32'b0;
-    assign lo_i = 32'b0;
+    // --- 【修改点1】 接收 HI/LO 写信号 ---
+    // assign w_hi_we = 1'b0;
+    // assign w_lo_we = 1'b0;
+    assign { w_hi_we, w_lo_we, hi_i, lo_i } = mem_to_wb1;
     
+    // --- 【修改点2】 输出到 Regfile 进行实际写入 ---
     assign wb_to_id_wf = { w_hi_we, w_lo_we, hi_i, lo_i };
     assign wb_to_id_2 = { w_hi_we, w_lo_we, hi_i, lo_i };
     

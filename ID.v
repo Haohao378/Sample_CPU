@@ -14,7 +14,7 @@ module ID(
     input wire [37:0] mem_to_id_bus,
     input wire [37:0] wb_to_id_bus, 
 
-    // ------ HI/LO 前推 (Passpoint 36 仍屏蔽) ------
+    // ------ HI/LO 前推 ------
     input wire [65:0] ex_to_id_2,   
     input wire[65:0] mem_to_id_2,   
     input wire[65:0] wb_to_id_2,    
@@ -22,7 +22,7 @@ module ID(
     // ------ IF 输入 ------
     input wire [`IF_TO_ID_WD-1:0] if_to_id_bus, 
     input wire [31:0] inst_sram_rdata, 
-    input wire inst_is_load,        // 关键：来自 EX 阶段，判断上一条是否为 Load
+    input wire inst_is_load,        
     input wire [`WB_TO_RF_WD-1:0] wb_to_rf_bus, 
 
     // ------ 输出到 EX ------
@@ -172,10 +172,8 @@ module ID(
     assign sel = inst[2:0];      
 
     // =========================================================================
-    // 3. Load-Use 冒险检测 (Passpoint 36 核心功能)
+    // 3. Load-Use 冒险检测
     // =========================================================================
-    // 如果上一条指令是 Load (inst_is_load=1)，且它的目标寄存器 (ex_to_id_bus[36:32])
-    // 等于当前指令的源寄存器 (rs 或 rt)，则必须暂停。
     assign stallreq_for_id = (inst_is_load == 1'b1 && (rs == ex_to_id_bus[36:32] || rt == ex_to_id_bus[36:32] ));
 
     // --- 译码器实例化 ---
@@ -195,7 +193,6 @@ module ID(
     wire op_and, op_nor, op_or, op_xor;
     wire op_sll, op_srl, op_sra, op_lui;
 
-    // --- 指令判断逻辑 (Passpoint 36 恢复所有基础 ALU 和 LW/SW) ---
     assign inst_ori     = op_d[6'b00_1101];
     assign inst_lui     = op_d[6'b00_1111];
     assign inst_addiu   = op_d[6'b00_1001];
@@ -207,12 +204,8 @@ module ID(
     assign inst_sll     = op_d[6'b00_0000] & rs_d[5'b0_0000] & func_d[6'b00_0000]; 
     assign inst_bne     = op_d[6'b00_0101];
     assign inst_or      = op_d[6'b00_0000] & (sa==5'b0_0000) & func_d[6'b10_0101];
-
-    // --- 恢复：Load/Store ---
     assign inst_lw      = op_d[6'b10_0011]; 
     assign inst_sw      = op_d[6'b10_1011]; 
-    
-    // --- 恢复：完整逻辑运算和移位 ---
     assign inst_xor     = op_d[6'b00_0000] & (sa==5'b0_0000) & func_d[6'b10_0110];
     assign inst_sltu    = op_d[6'b00_0000] & (sa==5'b0_0000) & func_d[6'b10_1011];
     assign inst_slt     = op_d[6'b00_0000] & (sa==5'b0_0000) & func_d[6'b10_1010];
@@ -231,25 +224,23 @@ module ID(
     assign inst_srav    = op_d[6'b00_0000] & (sa==5'b0_0000) & func_d[6'b00_0111];
     assign inst_srl     = op_d[6'b00_0000] & (rs==5'b0_0000) & func_d[6'b00_0010];
     assign inst_srlv    = op_d[6'b00_0000] & (sa==5'b0_0000) & func_d[6'b00_0110];
-    
-    // 分支
     assign inst_bgez    = op_d[6'b00_0001] & (rt==5'b0_0001); 
     assign inst_bltz    = op_d[6'b00_0001] & (rt==5'b0_0000);
-    assign inst_bgtz    = op_d[6'b00_0111] & (rt==5'b0_0000);
-    assign inst_blez    = op_d[6'b00_0110] & (rt==5'b0_0000);
     assign inst_bgezal  = op_d[6'b00_0001] & (rt==5'b1_0001);
     assign inst_bltzal  = op_d[6'b00_0001] & (rt==5'b1_0000);
+    assign inst_bgtz    = op_d[6'b00_0111] & (rt==5'b0_0000);
+    assign inst_blez    = op_d[6'b00_0110] & (rt==5'b0_0000);
     assign inst_jalr    = op_d[6'b00_0000] & (rt==5'b0_0000) & (sa==5'b0_0000) & func_d[6'b00_1001];
 
-    // Passpoint 36 仍屏蔽乘除法/字节访问
-    assign inst_mflo    = 1'b0; 
-    assign inst_mfhi    = 1'b0; 
-    assign inst_mthi    = 1'b0; 
-    assign inst_mtlo    = 1'b0; 
-    assign inst_div     = 1'b0; 
-    assign inst_divu    = 1'b0; 
-    assign inst_mult    = 1'b0; 
-    assign inst_multu   = 1'b0; 
+    // --- 【修改点1】 解除乘除法与HI/LO指令屏蔽 ---
+    assign inst_mfhi    = op_d[6'b00_0000] & (rs==5'b0) & (rt==5'b0) & (sa==5'b0) & func_d[6'b01_0000]; 
+    assign inst_mflo    = op_d[6'b00_0000] & (rs==5'b0) & (rt==5'b0) & (sa==5'b0) & func_d[6'b01_0010]; 
+    assign inst_mthi    = op_d[6'b00_0000] & (rt==5'b0) & (rd==5'b0) & (sa==5'b0) & func_d[6'b01_0001]; 
+    assign inst_mtlo    = op_d[6'b00_0000] & (rt==5'b0) & (rd==5'b0) & (sa==5'b0) & func_d[6'b01_0011]; 
+    assign inst_div     = op_d[6'b00_0000] & (rd==5'b0) & (sa==5'b0) & func_d[6'b01_1010]; 
+    assign inst_divu    = op_d[6'b00_0000] & (rd==5'b0) & (sa==5'b0) & func_d[6'b01_1011]; 
+    assign inst_mult    = op_d[6'b00_0000] & (rd==5'b0) & (sa==5'b0) & func_d[6'b01_1000]; 
+    assign inst_multu   = op_d[6'b00_0000] & (rd==5'b0) & (sa==5'b0) & func_d[6'b01_1001]; 
 
     assign inst_lb      = 1'b0; 
     assign inst_lbu     = 1'b0; 
@@ -257,29 +248,29 @@ module ID(
     assign inst_lhu     = 1'b0; 
     assign inst_sb      = 1'b0; 
     assign inst_sh      = 1'b0; 
-
     assign inst_lsa     = 1'b0; 
 
-    // --- ALU 输入选择 (恢复 LW/SW 的源选择) ---
-    // sel_alu_src1[0]: rs
+    // --- ALU 输入选择 (增加乘除法作为src) ---
     assign sel_alu_src1[0] = inst_ori | inst_addiu | inst_subu | inst_addu | inst_or | inst_lw | inst_sw | inst_xor | inst_sltu | inst_slt
                                 | inst_slti | inst_sltiu | inst_add | inst_addi | inst_sub | inst_and | inst_andi | inst_nor | inst_xori
-                                | inst_sllv | inst_srav | inst_srlv;
+                                | inst_sllv | inst_srav | inst_srlv | inst_mthi | inst_mtlo | inst_div | inst_divu | inst_mult | inst_multu; // 添加 mult/div/mthi/mtlo
     assign sel_alu_src1[1] = inst_jal | inst_bgezal |inst_bltzal | inst_jalr;
     assign sel_alu_src1[2] = inst_sll | inst_sra | inst_srl;
 
-    // sel_alu_src2[0]: rt
     assign sel_alu_src2[0] = inst_subu | inst_addu | inst_sll | inst_or | inst_xor | inst_sltu | inst_slt | inst_add | inst_sub | inst_and |
-                              inst_nor | inst_sllv | inst_sra | inst_srav | inst_srl | inst_srlv;
-    // sel_alu_src2[1]: 立即数符号扩展 (LW/SW 需要!)
+                              inst_nor | inst_sllv | inst_sra | inst_srav | inst_srl | inst_srlv | inst_div | inst_divu | inst_mult | inst_multu; // 添加 mult/div
     assign sel_alu_src2[1] = inst_lui | inst_addiu | inst_lw | inst_sw | inst_slti | inst_sltiu | inst_addi;
-    
     assign sel_alu_src2[2] = inst_jal | inst_bgezal | inst_bltzal | inst_jalr;
     assign sel_alu_src2[3] = inst_ori | inst_andi | inst_xori;
 
-    assign lo_hi_r = 2'b00;
+    // --- 【修改点2】 HI/LO 读写使能设置 ---
+    assign lo_hi_r[0] = inst_mfhi; // 读 HI
+    assign lo_hi_r[1] = inst_mflo; // 读 LO
+    
+    // 写 HI/LO (乘法/除法/MTHI/MTLO)
+    assign lo_hi_w[0] = inst_mult | inst_multu | inst_div | inst_divu | inst_mthi; 
+    assign lo_hi_w[1] = inst_mult | inst_multu | inst_div | inst_divu | inst_mtlo;
 
-    // --- ALU Opcode (恢复加法用于 LW/SW) ---
     assign op_add = inst_addiu | inst_jal | inst_addu | inst_lw | inst_sw | inst_add | inst_addi | inst_bgezal | inst_bltzal | inst_jalr;
     assign op_sub = inst_subu | inst_sub;
     assign op_slt = inst_slt | inst_slti;
@@ -297,36 +288,30 @@ module ID(
                      op_and, op_nor, op_or, op_xor,
                      op_sll, op_srl, op_sra, op_lui};
 
-    // --- 恢复：Data RAM Enable (LW/SW) ---
     assign data_ram_en = inst_lw | inst_sw;
     assign data_ram_wen = inst_sw ? 4'b1111 : 4'b0000;
-    
-    // --- 恢复：读模式 (LW) ---
     assign data_ram_read = inst_lw ? 4'b1111 : 4'b0000;
 
-    // --- 寄存器写控制 (恢复 LW 写回) ---
+    // --- 【修改点3】 通用寄存器写使能 ---
+    // 注意：MULT/DIV/MTHI/MTLO 不写通用寄存器，只有 MFHI/MFLO 写
     assign rf_we = inst_ori | inst_lui | inst_addiu | inst_subu | inst_jal |inst_addu | inst_sll | inst_or | inst_xor | inst_lw | inst_sltu
       | inst_slt | inst_slti | inst_sltiu | inst_add | inst_addi | inst_sub | inst_and | inst_andi | inst_nor | inst_sllv | inst_xori | inst_sra
-      | inst_srav | inst_srl | inst_srlv | inst_bgezal | inst_bltzal | inst_jalr;
+      | inst_srav | inst_srl | inst_srlv | inst_bgezal | inst_bltzal | inst_jalr 
+      | inst_mfhi | inst_mflo; // 增加 MFHI, MFLO
 
     assign sel_rf_dst[0] = inst_subu | inst_addu | inst_sll | inst_or | inst_xor | inst_sltu | inst_slt | inst_add | inst_sub | inst_and | inst_nor
-                             | inst_sllv | inst_sra | inst_srav | inst_srl | inst_srlv | inst_jalr;
+                             | inst_sllv | inst_sra | inst_srav | inst_srl | inst_srlv | inst_jalr 
+                             | inst_mfhi | inst_mflo; // 增加 MFHI, MFLO
     
-    // LW 也是写 rt
     assign sel_rf_dst[1] = inst_ori | inst_lui | inst_addiu | inst_lw | inst_slti | inst_sltiu | inst_addi | inst_andi | inst_xori;
-    
     assign sel_rf_dst[2] = inst_jal | inst_bgezal | inst_bltzal;
-
-    assign lo_hi_w = 2'b00;
 
     assign rf_waddr = {5{sel_rf_dst[0]}} & rd
                     | {5{sel_rf_dst[1]}} & rt
                     | {5{sel_rf_dst[2]}} & 32'd31;
 
-    // --- 恢复：写回数据来源 (1 代表来自 Load) ---
     assign sel_rf_res = inst_lw ? 1'b1 : 1'b0;
 
-    // --- ID 到 EX 总线打包 ---
     assign id_to_ex_bus = {
         id_pc,          
         inst,           
@@ -347,7 +332,6 @@ module ID(
         data_ram_read   
     };
 
-    // --- 分支跳转逻辑 (不变) ---
     wire br_e;              
     wire [31:0] br_addr;    
     wire rs_eq_rt;          
