@@ -123,11 +123,10 @@ module EX(
     
     // 简单恢复 SW 的写逻辑 (全写)
     // Passpoint 36 暂时不测 SB/SH，所以如果是写指令，直接给 4'b1111 即可
-    // 如果后续需要支持 SB/SH，这里需要恢复移位掩码逻辑
-    assign data_sram_wen = data_ram_wen; // ID 阶段对 SW 已经给出了 1111
+    assign data_sram_wen = data_ram_wen; 
 
     assign data_sram_addr = ex_result; // ALU 计算出的地址
-    assign data_sram_wdata = rf_rdata2; // SW 写入的数据是 rt (未处理对齐，SW 不需要)
+    assign data_sram_wdata = rf_rdata2; // SW 写入的数据
 
     assign ex_to_mem_bus = {
         ex_pc,          
