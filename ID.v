@@ -1,353 +1,527 @@
-// ID.v - 指令译码阶段模块
-// 功能：解析指令，读取寄存器，生成控制信号，检测分支，传递到执行阶段
+`include "lib/defines.vh" // 引入宏定义文件，包含总线宽度、控制信号等的定义
 
-`include "lib/defines.vh"  // 包含定义文件，里面有各种常量和参数定义
+module ID(
+    input wire clk,                 // 时钟信号
+    input wire rst,                 // 复位信号，高电平有效
+    // input wire flush,            // 流水线冲刷信号（当前被注释掉）
+    input wire [`StallBus-1:0] stall, // 流水线暂停信号总线，每一位对应一个流水级是否需要暂停
 
-module ID(  // ID模块定义，这是流水线的第二个阶段 - 译码阶段
-    // 时钟和复位信号
-    input wire clk,                    // 时钟信号，上升沿触发
-    input wire rst,                    // 复位信号，高电平有效
-    // input wire flush,                // 流水线刷新信号（被注释掉）
-    input wire [`StallBus-1:0] stall,  // 流水线暂停控制信号总线，来自控制单元
-    
-    output wire stallreq,              // 暂停请求信号，ID阶段向控制单元请求暂停
+    output wire stallreq_for_id,    // ID阶段产生的暂停请求信号（通常用于Load-Use冒险）
 
-    // 来自IF阶段的输入总线
-    input wire [`IF_TO_ID_WD-1:0] if_to_id_bus,  // 包含PC值和芯片使能信号
+    output wire stallreq,           // 通用的暂停请求信号（代码中似乎未赋值逻辑，可能是预留）
+    // ------ 数据前推（Forwarding）相关输入 ------
+    // 为了解决数据冒险，需要从后续流水级（EX, MEM, WB）获取最新的数据
+    input wire [37:0] ex_to_id_bus, // 来自EX阶段的数据前推总线（包含EX阶段要写的寄存器地址和数据）
 
-    // 来自指令存储器的输入
-    input wire [31:0] inst_sram_rdata,  // 从指令存储器读取的32位指令
+    input wire [37:0] mem_to_id_bus,// 来自MEM阶段的数据前推总线
 
-    // 来自WB阶段的写回总线（用于数据前递）
-    input wire [`WB_TO_RF_WD-1:0] wb_to_rf_bus,  // 写回寄存器文件的信息
+    input wire [37:0] wb_to_id_bus, // 来自WB阶段的数据前推总线
 
-    // 输出到EX阶段的总线
-    output wire [`ID_TO_EX_WD-1:0] id_to_ex_bus,  // 包含译码结果和操作数等信息
+    // ------ HI/LO 寄存器相关的前推输入（针对乘除法等） ------
+    input wire [65:0] ex_to_id_2,   // 来自EX阶段的HI/LO寄存器前推数据
 
-    // 分支相关输出
-    output wire [`BR_WD-1:0] br_bus              // 分支使能信号和目标地址
+    input wire[65:0] mem_to_id_2,   // 来自MEM阶段的HI/LO寄存器前推数据
+
+    input wire[65:0] wb_to_id_2,    // 来自WB阶段的HI/LO寄存器前推数据
+
+    // ------ 上一级（IF）传入的数据 ------
+    input wire [`IF_TO_ID_WD-1:0] if_to_id_bus, // IF阶段传来的信息总线（包含PC值等）
+
+    input wire [31:0] inst_sram_rdata, // 从指令存储器（SRAM）读出的32位指令码
+
+    input wire inst_is_load,        // 指示上一条指令（EX阶段）是否是加载指令（用于检测Load-Use冒险）
+
+    input wire [`WB_TO_RF_WD-1:0] wb_to_rf_bus, // WB阶段写回寄存器堆的信息（用于正常的寄存器写回）
+
+    // ------ 输出到下一级（EX）的数据 ------
+    output wire [`ID_TO_EX_WD-1:0] id_to_ex_bus, // ID阶段解码后传给EX阶段的信息总线
+
+//    output wire [67:0] id_to_ex_2, // (注释掉) 可能用于传递HI/LO相关的额外信息
+
+    // ------ 分支跳转相关输出 ------
+    output wire [`BR_WD-1:0] br_bus, // 分支跳转总线（包含是否跳转 br_e 和跳转地址 br_addr）
+
+    input wire [65:0] wb_to_id_wf,   // 可能是WB阶段写回HI/LO寄存器的写标志和数据
+    input wire ready_ex_to_id        // 握手信号，指示EX阶段是否准备好接收数据
 );
 
-    // 内部寄存器和连线定义
-    reg [`IF_TO_ID_WD-1:0] if_to_id_bus_r;  // 寄存器，存储来自IF阶段的信息(33bit)
-    wire [31:0] inst;                        // 连线，存储当前指令
-    wire [31:0] id_pc;                      // 连线，存储当前指令的PC地址
-    wire ce;                                 // 连线，芯片使能信号
+    // =========================================================================
+    // 1. 流水线寄存器与指令缓冲逻辑
+    // =========================================================================
+    reg [31:0] inst_stall;           // 暂存指令的寄存器，用于流水线暂停时保存当前指令
+    reg inst_stall_en;               // 指示 inst_stall 是否有效
+    reg [`IF_TO_ID_WD-1:0] if_to_id_bus_r; // ID阶段的流水线寄存器，保存从IF传来的PC等信息
+//    reg[65:0] wb_to_id_wf_r;       // (注释掉)
 
-    // 来自WB阶段的写回信号
-    wire wb_rf_we;                          // 写回使能信号
-    wire [4:0] wb_rf_waddr;                // 写回寄存器地址（5位，支持32个寄存器）
-    wire [31:0] wb_rf_wdata;                // 写回数据
+    wire [31:0] inst;                // 最终用于解码的当前指令
+    wire [31:0] id_pc;               // 当前指令的PC地址
+    wire ce;                         // 片选/使能信号（来自IF）
+    wire [31:0]inst_stall1;          // 辅助连线
+    wire inst_stall_en1;             // 辅助连线
 
-    // IF到ID阶段寄存器更新逻辑 - 在时钟上升沿触发
-    always @ (posedge clk) begin  // 当clk从0变到1时执行
-        if (rst) begin  // 如果复位信号有效
-            if_to_id_bus_r <= `IF_TO_ID_WD'b0;  // 将寄存器清零（全0）
+    wire wb_rf_we;                   // WB阶段传来的写寄存器使能
+    wire [4:0] wb_rf_waddr;          // WB阶段传来的写寄存器地址
+    wire [31:0] wb_rf_wdata;         // WB阶段传来的写寄存器数据
+
+    // --- 流水线寄存器更新逻辑 ---
+    always @ (posedge clk) begin
+        if (rst) begin
+            // 复位时清空流水线寄存器
+            if_to_id_bus_r <= `IF_TO_ID_WD'b0;
+//            wb_to_id_wf_r <= 66'b0;
         end
-        // else if (flush) begin  // 以下代码被注释掉，可能在后续版本使用
-        //     ic_to_id_bus <= `IC_TO_ID_WD'b0;
-        // end
-        else if (stall[1]==`Stop && stall[2]==`NoStop) begin  // 如果ID阶段需要暂停但EX阶段不需要
-            if_to_id_bus_r <= `IF_TO_ID_WD'b0;  // 插入气泡（bubble），传递空指令
+        // else if (flush) begin ... end // 冲刷逻辑（被注释）
+        // 如果ID阶段暂停(`Stop)且EX阶段不暂停(`NoStop)，说明ID阶段被阻塞但EX继续走，
+        // 此时通常需要向EX发送气泡(bubble)，并将ID寄存器清零或保持。这里选择清零（插入气泡）。
+        else if (stall[1]==`Stop && stall[2]==`NoStop) begin
+            if_to_id_bus_r <= `IF_TO_ID_WD'b0;
+//            wb_to_id_wf_r <= 66'b0;
         end
-        else if (stall[1]==`NoStop) begin  // 如果ID阶段不需要暂停
-            if_to_id_bus_r <= if_to_id_bus;  // 正常接收来自IF阶段的信息
+        // 如果ID阶段不暂停，则正常接收IF阶段传来的数据
+        else if (stall[1]==`NoStop) begin
+            if_to_id_bus_r <= if_to_id_bus;
+//            wb_to_id_wf_r <= wb_to_id_wf;
         end
-        // 如果stall[1]为`Stop且stall[2]也为`Stop，保持当前值不变（暂停）
     end
-    
-    // 指令赋值 - 直接使用从指令存储器读取的数据
-    assign inst = inst_sram_rdata;  // 将32位指令数据赋给inst变量
-    
-    // 从IF到ID阶段寄存器中提取信号
-    // if_to_id_bus格式：{ce, id_pc}，ce占1位，id_pc占32位
+
+    // --- 指令暂停缓冲逻辑 ---
+    // 当流水线暂停时，指令存储器读出的数据可能会变或丢失，需要用寄存器锁存住当前指令
+    always @ (posedge clk) begin
+        inst_stall_en<=1'b0;
+        inst_stall <=32'b0;
+        // 如果ID阶段暂停(stall[1]==1) 且 下一级没准备好，则锁存当前指令
+        if(stall[1] == 1'b1 & ready_ex_to_id ==1'b0)begin
+            inst_stall <= inst;      // 锁存当前指令
+            inst_stall_en<=1'b1;     // 标记锁存有效
+        end
+    end 
+
+    assign inst_stall1 = inst_stall;
+    assign inst_stall_en1 = inst_stall_en ;
+
+    // 选择最终指令：如果处于暂停锁存状态，用锁存的指令；否则用SRAM读出的新指令
+    assign inst = inst_stall_en1 ? inst_stall1  :inst_sram_rdata;
+
+    // --- 解包 IF 传来的数据 ---
     assign {
-        ce,      // 1位：芯片使能信号
-        id_pc    // 32位：当前指令的PC地址
+        ce,     // Chip Enable
+        id_pc   // 当前PC
     } = if_to_id_bus_r;
-    
-    // 从WB阶段写回总线中提取信号
-    // wb_to_rf_bus格式：{wb_rf_we, wb_rf_waddr, wb_rf_wdata}
+
+    // --- 解包 WB 阶段写回的数据 ---
     assign {
-        wb_rf_we,     // 1位：写回使能信号
-        wb_rf_waddr,  // 5位：写回寄存器地址
-        wb_rf_wdata   // 32位：写回数据
+        wb_rf_we,
+        wb_rf_waddr,
+        wb_rf_wdata
     } = wb_to_rf_bus;
 
-    // 指令字段定义 - 从32位指令中提取各个字段
-    wire [5:0] opcode;      // 操作码，6位，指令[31:26]
-    wire [4:0] rs,rt,rd,sa; // 寄存器编号，各5位。rs:指令[25:21], rt:指令[20:16], rd:指令[15:11], sa:指令[10:6]
-    wire [5:0] func;        // 功能码，6位，指令[5:0]，用于R型指令
-    wire [15:0] imm;        // 立即数，16位，指令[15:0]
-    wire [25:0] instr_index; // 指令索引，26位，指令[25:0]，用于J型指令
-    wire [19:0] code;       // 代码字段，20位，指令[25:6]
-    wire [4:0] base;        // 基址寄存器，5位，指令[25:21]，用于加载/存储指令
-    wire [15:0] offset;     // 偏移量，16位，指令[15:0]，用于加载/存储指令
-    wire [2:0] sel;         // 选择字段，3位，指令[2:0]，用于特殊指令
+    // =========================================================================
+    // 2. 指令字段拆解 (Instruction Decoding Fields)
+    // =========================================================================
+    wire [5:0] opcode;      // 操作码 (高6位)
+    wire [4:0] rs,rt,rd,sa; // 源寄存器、目标寄存器、移位量
+    wire [5:0] func;        // 功能码 (低6位，用于R型指令)
+    wire [15:0] imm;        // 立即数
+    wire [25:0] instr_index;// 26位跳转地址索引 (用于J型指令)
+    wire [19:0] code;       // (通常用于syscall/break等的code字段)
+    wire [4:0] base;        // 基址寄存器 (同rs)
+    wire [15:0] offset;     // 偏移量 (同imm)
+    wire [2:0] sel;         // (可能用于CP0指令的选择域)
 
-    // 译码器输出信号定义
-    wire [63:0] op_d, func_d;     // 操作码和功能码的译码结果，64位宽
-    wire [31:0] rs_d, rt_d, rd_d, sa_d;  // 寄存器地址的译码结果，各32位宽
+    // 解码后的控制信号定义
+    wire [63:0] op_d, func_d; // 独热码解码结果
+    wire [31:0] rs_d, rt_d, rd_d, sa_d; // (定义了但后面似乎没完全用到)
 
-    // ALU控制信号
-    wire [2:0] sel_alu_src1;  // ALU第一个操作数的选择信号，3位
-    wire [3:0] sel_alu_src2;  // ALU第二个操作数的选择信号，4位
-    wire [11:0] alu_op;      // ALU操作类型，12位
+    wire [2:0] sel_alu_src1; // ALU操作数1来源选择信号
+    wire [3:0] sel_alu_src2; // ALU操作数2来源选择信号
+    wire [11:0] alu_op;      // ALU操作码
 
-    // 数据存储器控制信号
-    wire data_ram_en;        // 数据存储器使能信号
-    wire [3:0] data_ram_wen; // 数据存储器写使能信号，4位字节使能
-    
-    // 寄存器文件控制信号
-    wire rf_we;              // 寄存器写使能信号
-    wire [4:0] rf_waddr;     // 要写入的寄存器地址，5位
-    wire sel_rf_res;         // 寄存器写入数据源选择（0:ALU结果，1:内存数据）
-    wire [2:0] sel_rf_dst;   // 目标寄存器选择信号，3位
+    wire data_ram_en;        // 数据存储器使能
+    wire [3:0] data_ram_wen; // 数据存储器写使能（按字节选通）
+    wire [3:0] data_ram_read;// 数据存储器读模式（字节/半字/字）
 
-    // 寄存器读取数据
-    wire [31:0] rdata1, rdata2;  // 从寄存器文件读取的两个32位数据
+    wire rf_we;              // ID阶段产生的寄存器堆写使能
+    wire [4:0] rf_waddr;     // ID阶段产生的寄存器堆写地址
+    wire sel_rf_res;         // 写回数据来源选择 (0:ALU结果, 1:内存结果)
+    wire [2:0] sel_rf_dst;   // 写回目标寄存器选择 (rd, rt, 或 31号$ra)
 
-    // 寄存器文件实例化 - 存储32个32位寄存器
-    // 功能：提供寄存器读写功能，支持两个读端口和一个写端口
+    wire [31:0] rdata1, rdata2; // 从寄存器堆读出（或经过前推后）的源操作数
+
+    // HI/LO 寄存器相关信号
+    wire w_hi_we;            // 写HI寄存器使能
+    wire w_lo_we;            // 写LO寄存器使能
+    wire [31:0]hi_i;         // 写入HI的数据
+    wire [31:0]lo_i;         // 写入LO的数据
+
+    wire r_hi_we;            // 读HI寄存器使能
+    wire r_lo_we;            // 读LO寄存器使能
+    wire[31:0] hi_o;         // 读出的HI数据
+    wire[31:0] lo_o;         // 读出的LO数据
+
+    wire [1:0] lo_hi_r;      // HI/LO 读控制信号组合
+    wire [1:0] lo_hi_w;      // HI/LO 写控制信号组合
+
+    wire inst_lsa;           // 龙芯架构扩展指令 LSA (Load Scaled Address) 标志
+
+    // 解包 WB 阶段传来的 HI/LO 写信号
+    assign
+    {
+        w_hi_we,
+        w_lo_we,
+        hi_i,
+        lo_i
+    } = wb_to_id_wf;
+
+    // =========================================================================
+    // 3. 寄存器堆实例化 (Regfile Instance)
+    // =========================================================================
+    // 该模块负责寄存器的读写，以及核心的数据前推逻辑(Forwarding)通常也在这里处理
     regfile u_regfile(
-    	.clk    (clk    ),           // 时钟信号
-        .raddr1 (rs ),              // 第一个读端口地址（源寄存器1）
-        .rdata1 (rdata1 ),          // 第一个读端口数据输出
-        .raddr2 (rt ),              // 第二个读端口地址（源寄存器2）
-        .rdata2 (rdata2 ),          // 第二个读端口数据输出
-        .we     (wb_rf_we     ),    // 写使能信号
-        .waddr  (wb_rf_waddr  ),    // 写端口地址（目标寄存器）
-        .wdata  (wb_rf_wdata  )     // 写端口数据输入
+        .inst   (inst),         // 当前指令（用于辅助判断相关性）
+        .clk    (clk    ),
+        // --- 读端口 ---
+        .raddr1 (rs ),          // 读地址1
+        .rdata1 (rdata1 ),      // 读数据1（输出，已处理前推）
+        .raddr2 (rt ),          // 读地址2
+        .rdata2 (rdata2 ),      // 读数据2（输出，已处理前推）
+        // --- 写端口 (来自WB阶段) ---
+        .we     (wb_rf_we     ),
+        .waddr  (wb_rf_waddr  ),
+        .wdata  (wb_rf_wdata  ),
+        // --- 前推数据输入 ---
+        .ex_to_id_bus(ex_to_id_bus), // EX阶段前推
+        .mem_to_id_bus(mem_to_id_bus), // MEM阶段前推
+        .wb_to_id_bus(wb_to_id_bus),   // WB阶段前推
+        .ex_to_id_2(ex_to_id_2),       // HI/LO EX前推
+        .mem_to_id_2(mem_to_id_2),     // HI/LO MEM前推
+        .wb_to_id_2(wb_to_id_2),       // HI/LO WB前推
+        // --- HI/LO 写端口 ---
+        .w_hi_we  (w_hi_we),
+        .w_lo_we  (w_lo_we),
+        .hi_i(hi_i),
+        .lo_i(lo_i),
+        // --- HI/LO 读端口 ---
+        .r_hi_we (lo_hi_r[0]),  // 读HI使能
+        .r_lo_we (lo_hi_r[1]),  // 读LO使能
+        .hi_o(hi_o),            // 读出的HI值
+        .lo_o(lo_o),            // 读出的LO值
+        .inst_lsa(inst_lsa)     // LSA指令指示
     );
 
-    // 指令字段提取 - 从32位指令中提取各个字段
-    // MIPS指令格式：R型、I型、J型
-    assign opcode = inst[31:26];      // 操作码，6位，指令的最高6位
-    assign rs = inst[25:21];          // 源寄存器1，5位
-    assign rt = inst[20:16];          // 源寄存器2，5位
-    assign rd = inst[15:11];          // 目标寄存器，5位
-    assign sa = inst[10:6];           // 移位量，5位，用于移位指令
-    assign func = inst[5:0];           // 功能码，6位，R型指令的最低6位
-    assign imm = inst[15:0];          // 立即数，16位，I型指令的低位
-    assign instr_index = inst[25:0];  // 指令索引，26位，J型指令的低位
-    assign code = inst[25:6];         // 代码字段，20位
-    assign base = inst[25:21];        // 基址寄存器，5位，加载/存储指令使用
-    assign offset = inst[15:0];       // 偏移量，16位，加载/存储指令使用
-    assign sel = inst[2:0];           // 选择字段，3位
 
-    // 指令类型识别信号
-    wire inst_ori, inst_lui, inst_addiu, inst_beq;  // 具体的指令类型
-    /*
-    inst_ori: "我是 ORI" (Or Immediate)。
+    // =========================================================================
+    // 4. 指令字段赋值
+    // =========================================================================
+    assign opcode = inst[31:26]; // MIPS指令高6位
+    assign rs = inst[25:21];     // 源寄存器1
+    assign rt = inst[20:16];     // 源寄存器2 或 目标寄存器
+    assign rd = inst[15:11];     // 目标寄存器
+    assign sa = inst[10:6];      // 移位量 (Shift Amount)
+    assign func = inst[5:0];     // 功能码
+    assign imm = inst[15:0];     // 16位立即数
+    assign instr_index = inst[25:0]; // 26位跳转索引
+    assign code = inst[25:6];    // 异常码字段
+    assign base = inst[25:21];   // 基址寄存器 (同rs)
+    assign offset = inst[15:0];  // 偏移量 (同imm)
+    assign sel = inst[2:0];      // 选择域
 
-    意思：我要做“或运算”，而且是跟一个立即数做。
+    // =========================================================================
+    // 5. 暂停请求逻辑 (Load-Use Hazard Detection)
+    // =========================================================================
+    // 如果上一条指令(在EX阶段)是加载指令(Load)，且其目标寄存器与当前指令的源寄存器(rs或rt)相同，
+    // 则发生Load-Use冒险，必须暂停ID阶段一个周期，等待数据从内存读出。
+    assign stallreq_for_id = (inst_is_load == 1'b1 && (rs == ex_to_id_bus[36:32] || rt == ex_to_id_bus[36:32] ));
+    // assign inst_stall =  (stallreq_for_id) ? inst : 32'b0; (注释掉的代码)
 
-    inst_lui: "我是 LUI" (Load Upper Immediate)。
+    // =========================================================================
+    // 6. 指令译码 (Instruction Decoding)
+    // =========================================================================
+    // 定义每种具体指令的标志位
+    wire inst_ori, inst_lui, inst_addiu, inst_beq, inst_subu, inst_jr, inst_jal, inst_addu, inst_bne, inst_sll, inst_or,
+         inst_lw, inst_sw, inst_xor ,inst_sltu, inst_slt, inst_slti, inst_sltiu, inst_j, inst_add, inst_addi ,inst_sub,
+         inst_and , inst_andi, inst_nor, inst_xori, inst_sllv, inst_sra, inst_bgez, inst_bltz, inst_bgtz, inst_blez,
+         inst_bgezal,inst_bltzal, inst_jalr, inst_mflo, inst_mfhi, inst_mthi, inst_mtlo, inst_div, inst_divi, inst_mult,
+         inst_multu, inst_lb, inst_lbu, inst_lh, inst_lhu, inst_sb, inst_sh;
 
-    意思：我要把一个数加载到寄存器的高 16 位。
+    wire op_add, op_sub, op_slt, op_sltu; // ALU操作类别标志
+    wire op_and, op_nor, op_or, op_xor;
+    wire op_sll, op_srl, op_sra, op_lui;
 
-    inst_addiu: "我是 ADDIU" (Add Immediate Unsigned)。
-
-    意思：我要做加法，跟立即数加，别管符号位。
-
-    inst_beq: "我是 BEQ" (Branch if Equal)。
-
-    意思：如果两个数相等，我就跳转。
-    */
-
-    // ALU操作类型信号
-    wire op_add, op_sub, op_slt, op_sltu;  // 算术运算
-    /*
-    op_add (加法)功能：$A + B$。不仅是做加法：除了 add 指令，所有的内存读写（lw, sw）其实也是加法。因为计算内存地址时，需要用 基地址 + 偏移量。
-    op_sub (减法)功能：$A - B$。隐形用途：beq (相等跳转) 和 bne (不等跳转) 也是用减法。如果 $A - B = 0$，CPU 就知道它俩相等了。
-    op_slt (Set on Less Than - 有符号比较)功能：如果是负数 $-5$ 和正数 $3$ 比，它知道 $-5$ 更小。结果：如果 $A < B$，结果置 1；否则置 0。
-    op_sltu (Set on Less Than Unsigned - 无符号比较)功能：把所有数都当正数。比如地址比较时，或者处理超大整数时用。区别：在这里，0xFFFFFFFF (在有符号里是 -1) 会被当成很大的正数，比 0x00000001 大。
-    */
-    wire op_and, op_nor, op_or, op_xor;  // 逻辑运算
-    /*
-    op_and (与)
-    逻辑：全是 1 才是 1。
-    用途：“清零”。比如你想把一个数的低 8 位保留，高位全抹掉，就 AND 0x000000FF。
-    op_or (或)
-    逻辑：只要有 1 就是 1。
-    用途：“拼凑”。比如把两个半字节拼成一个整字节。
-    op_nor (或非)
-    逻辑：全不是 1 才是 1（先 OR 再取反）。
-    用途：MIPS 只有 NOR，没有 NOT。如果你想取反一个数（把 0 变 1，1 变 0），就用 NOR A, 0。
-    op_xor (异或)
-    逻辑：不一样就是 1，一样就是 0。
-    用途：“找不同” 或者 “翻转”。如果你想把某一位反转一下，就异或 1。
-    */
-    wire op_sll, op_srl, op_sra, op_lui; // 移位和加载高位运算
-    /*
-    op_sll (Shift Left Logical - 逻辑左移)
-    动作：往左推，右边补 0。
-    数学含义：相当于 乘以 2 的 N 次方。
-    op_srl (Shift Right Logical - 逻辑右移)
-    动作：往右推，左边补 0。
-    数学含义：相当于 除以 2 的 N 次方（针对无符号数）。
-    op_sra (Shift Right Arithmetic - 算术右移)
-    动作：往右推，但左边补符号位（原来最高位是 1 就补 1，是 0 就补 0）。
-    作用：这是为了带符号数设计的。比如 -8 (1111...1000) 右移变成 -4 (1111...1100)，必须补 1 才能保持它是负数。
-    op_lui (Load Upper Immediate - 加载高位)
-    动作：把一个 16 位的数字，直接搬到 32 位寄存器的 上半部分 ([31:16])，下半部分清零。
-    作用：MIPS 一条指令只能存 16 位常数。如果你想要个 32 位的大常数，必须分两步：先 LUI 搬一半到楼上，再用 OR 搬一半到楼下。
-    */
-
-    /*
-    独热码就是：“一群人里，永远只有一个人举手。”
-    */
-    // 操作码译码器 - 将6位操作码译码为64位独热码
+    // 实例化译码器，将6位输入转换为64位独热码输出
     decoder_6_64 u0_decoder_6_64(
-    	.in  (opcode  ),  // 输入：6位操作码
-        .out (op_d )      // 输出：64位译码结果，每一位对应一个操作码
+        .in  (opcode  ),
+        .out (op_d )    // 操作码的独热码
     );
 
-    // 功能码译码器 - 将6位功能码译码为64位独热码（用于R型指令）
     decoder_6_64 u1_decoder_6_64(
-    	.in  (func  ),    // 输入：6位功能码
-        .out (func_d )    // 输出：64位译码结果
+        .in  (func  ),
+        .out (func_d )  // 功能码的独热码
     );
-    
-    // 寄存器地址译码器1 - 将5位寄存器地址译码为32位独热码
+
+    // 下面两个译码器似乎将rs和rt也转成了独热码，用于辅助判断（如判断rs是否为0）
     decoder_5_32 u0_decoder_5_32(
-    	.in  (rs  ),      // 输入：5位源寄存器1地址
-        .out (rs_d )      // 输出：32位译码结果
+        .in  (rs  ),
+        .out (rs_d )
     );
 
-    // 寄存器地址译码器2 - 将5位寄存器地址译码为32位独热码
     decoder_5_32 u1_decoder_5_32(
-    	.in  (rt  ),      // 输入：5位源寄存器2地址
-        .out (rt_d )      // 输出：32位译码结果
+        .in  (rt  ),
+        .out (rt_d )
     );
 
-    
-    // 指令类型识别 - 根据操作码判断当前是什么指令
-    // 使用操作码的数值作为索引，从译码器输出中选择对应的位
-    assign inst_ori     = op_d[6'b00_1101];  // ori指令，操作码为0x0D（13）
-    assign inst_lui     = op_d[6'b00_1111];  // lui指令，操作码为0x0F（15）
-    assign inst_addiu   = op_d[6'b00_1001];  // addiu指令，操作码为0x09（9）
-    assign inst_beq     = op_d[6'b00_0100];  // beq指令，操作码为0x04（4）
+
+    // --- 具体指令判断逻辑 ---
+    // 根据MIPS指令集架构定义，结合opcode和func字段判断是哪条指令
+    assign inst_ori     = op_d[6'b00_1101];
+    assign inst_lui     = op_d[6'b00_1111];
+    assign inst_addiu   = op_d[6'b00_1001];
+    assign inst_beq     = op_d[6'b00_0100];
+    assign inst_subu    = op_d[6'b00_0000] & (sa==5'b0_0000) & func_d[6'b10_0011]; // R型指令
+    assign inst_jr      = op_d[6'b00_0000] & (inst[20:11]==10'b0000000000) & (sa==5'b0_0000) & func_d[6'b00_1000];
+    assign inst_jal     = op_d[6'b00_0011];
+    assign inst_addu    = op_d[6'b00_0000] & (sa==5'b0_0000) & func_d[6'b10_0001];
+    assign inst_sll     = op_d[6'b00_0000] & rs_d[5'b0_0000] & func_d[6'b00_0000]; // 移位指令通常rs为0
+    assign inst_bne     = op_d[6'b00_0101];
+    assign inst_or      = op_d[6'b00_0000] & (sa==5'b0_0000) & func_d[6'b10_0101];
+
+    assign inst_lw      = op_d[6'b10_0011]; // 加载字
+    assign inst_sw      = op_d[6'b10_1011]; // 存储字
+    assign inst_xor     = op_d[6'b00_0000] & (sa==5'b0_0000) & func_d[6'b10_0110];
+    assign inst_sltu    = op_d[6'b00_0000] & (sa==5'b0_0000) & func_d[6'b10_1011];
+    assign inst_slt     = op_d[6'b00_0000] & (sa==5'b0_0000) & func_d[6'b10_1010];
+    assign inst_slti    = op_d[6'b00_1010];
+    assign inst_sltiu   = op_d[6'b00_1011];
+    assign inst_j       = op_d[6'b00_0010];
+    assign inst_add     = op_d[6'b00_0000] & (sa==5'b0_0000) & func_d[6'b10_0000];
+    assign inst_addi    = op_d[6'b00_1000];
+    assign inst_sub     = op_d[6'b00_0000] & (sa==5'b0_0000) & func_d[6'b10_0010];
+    assign inst_and     = op_d[6'b00_0000] & (sa==5'b0_0000) & func_d[6'b10_0100];
+    assign inst_andi    = op_d[6'b00_1100];
+    assign inst_nor     = op_d[6'b00_0000] & (sa==5'b0_0000) & func_d[6'b10_0111];
+    assign inst_xori    = op_d[6'b00_1110];
+    assign inst_sllv    = op_d[6'b00_0000] & (sa==5'b0_0000) & func_d[6'b00_0100];
+    assign inst_sra     = op_d[6'b00_0000] & (rs==5'b0_0000) & func_d[6'b00_0011];
+    assign inst_srav    = op_d[6'b00_0000] & (sa==5'b0_0000) & func_d[6'b00_0111];
+    assign inst_srl     = op_d[6'b00_0000] & (rs==5'b0_0000) & func_d[6'b00_0010];
+    assign inst_srlv    = op_d[6'b00_0000] & (sa==5'b0_0000) & func_d[6'b00_0110];
+    assign inst_bgez    = op_d[6'b00_0001] & (rt==5'b0_0001); // REGIMM类分支
+    assign inst_bltz    = op_d[6'b00_0001] & (rt==5'b0_0000);
+    assign inst_bgtz    = op_d[6'b00_0111] & (rt==5'b0_0000);
+    assign inst_blez    = op_d[6'b00_0110] & (rt==5'b0_0000);
+    assign inst_bgezal  = op_d[6'b00_0001] & (rt==5'b1_0001);
+    assign inst_bltzal  = op_d[6'b00_0001] & (rt==5'b1_0000);
+    assign inst_jalr    = op_d[6'b00_0000] & (rt==5'b0_0000) & (sa==5'b0_0000) & func_d[6'b00_1001];
+
+    assign inst_mflo    = op_d[6'b00_0000] & (inst[25:16]==10'b0000000000) & (sa==5'b0_0000) & func_d[6'b01_0010]; // 移动HI/LO数据
+    assign inst_mfhi    = op_d[6'b00_0000] & (inst[25:16]==10'b0000000000) & (sa==5'b0_0000) & func_d[6'b01_0000];
+    assign inst_mthi    = op_d[6'b00_0000] & (inst[20:6]==10'b000000000000000)  & func_d[6'b01_0001];
+    assign inst_mtlo    = op_d[6'b00_0000] & (inst[20:6]==10'b000000000000000)  & func_d[6'b01_0011];
+    assign inst_div     = op_d[6'b00_0000] & (inst[15:6]==10'b0000000000) & func_d[6'b01_1010]; // 除法
+    assign inst_divu    = op_d[6'b00_0000] & (inst[15:6]==10'b0000000000) & func_d[6'b01_1011];
+    assign inst_mult    = op_d[6'b00_0000] & (inst[15:6]==10'b0000000000) & func_d[6'b01_1000]; // 乘法
+    assign inst_multu   = op_d[6'b00_0000] & (inst[15:6]==10'b0000000000) & func_d[6'b01_1001];
+
+    assign inst_lb      = op_d[6'b10_0000]; // 加载字节
+    assign inst_lbu     = op_d[6'b10_0100]; // 加载无符号字节
+    assign inst_lh      = op_d[6'b10_0001]; // 加载半字
+    assign inst_lhu     = op_d[6'b10_0101];
+    assign inst_sb      = op_d[6'b10_1000]; // 存储字节
+    assign inst_sh      = op_d[6'b10_1001]; // 存储半字
+
+    assign inst_lsa     = op_d[6'b01_1100] & inst[10:8]==3'b111 & inst[5:0]==6'b11_0111; // LSA指令
+
+    // =========================================================================
+    // 7. ALU 输入来源选择 (ALU MUX Control)
+    // =========================================================================
+    // sel_alu_src1: 选择ALU的操作数1
+    // [0] = 1: 来源于寄存器 rs (大多数运算指令)
+    assign sel_alu_src1[0] = inst_ori | inst_addiu | inst_subu | inst_addu | inst_or | inst_lw | inst_sw | inst_xor | inst_sltu | inst_slt
+                                | inst_slti | inst_sltiu | inst_add | inst_addi | inst_sub | inst_and | inst_andi | inst_nor | inst_xori
+                                | inst_sllv | inst_srav | inst_srlv | inst_mthi | inst_mtlo | inst_div | inst_divu | inst_mult | inst_multu
+                                | inst_lb | inst_lbu | inst_lh | inst_lhu | inst_sb | inst_sh | inst_lsa;
+
+    // [1] = 1: 来源于 PC (用于跳转链接指令，计算返回地址 PC+8)
+    assign sel_alu_src1[1] = inst_jal | inst_bgezal |inst_bltzal | inst_jalr;
+
+    // [2] = 1: 来源于 sa 移位量进行0扩展 (用于立即数移位指令)
+    assign sel_alu_src1[2] = inst_sll | inst_sra | inst_srl;
 
 
+    // sel_alu_src2: 选择ALU的操作数2
+    // [0] = 1: 来源于寄存器 rt (R型指令)
+    assign sel_alu_src2[0] = inst_subu | inst_addu | inst_sll | inst_or | inst_xor | inst_sltu | inst_slt | inst_add | inst_sub | inst_and |
+                              inst_nor | inst_sllv | inst_sra | inst_srav | inst_srl | inst_srlv | inst_div | inst_divu | inst_mult | inst_multu | inst_lsa;
 
-    // ALU第一个操作数源选择逻辑 - 3位选择信号
-    // sel_alu_src1格式：[2:0]，选择ALU的第一个输入操作数
-    assign sel_alu_src1[0] = inst_ori | inst_addiu;  // 位0：选择rs寄存器作为源1（ori或addiu指令）
+    // [1] = 1: 来源于立即数进行符号扩展 (I型算术指令、访存指令)
+    assign sel_alu_src2[1] = inst_lui | inst_addiu | inst_lw | inst_sw | inst_slti | inst_sltiu | inst_addi | inst_lb | inst_lbu | inst_lh | inst_lhu | inst_sb | inst_sh;
 
-    assign sel_alu_src1[1] = 1'b0;  // 位1：选择PC作为源1（当前未使用）
+    // [2] = 1: 来源于常数 8 (用于跳转链接指令，计算 PC+8)
+    assign sel_alu_src2[2] = inst_jal | inst_bgezal | inst_bltzal | inst_jalr;
 
-    assign sel_alu_src1[2] = 1'b0;  // 位2：选择移位量作为源1（当前未使用）
+    // [3] = 1: 来源于立即数进行0扩展 (逻辑运算指令如ORI)
+    assign sel_alu_src2[3] = inst_ori | inst_andi | inst_xori;
 
-    
-    // ALU第二个操作数源选择逻辑 - 4位选择信号
-    // sel_alu_src2格式：[3:0]，选择ALU的第二个输入操作数
-    assign sel_alu_src2[0] = 1'b0;  // 位0：选择rt寄存器作为源2（当前未使用）
-    
-    assign sel_alu_src2[1] = inst_lui | inst_addiu;  // 位1：选择符号扩展立即数（lui或addiu指令）
+    // --- HI/LO 读写控制信号 ---
+    // [0] = 1: 读 LO
+    assign lo_hi_r[0] = inst_mflo;
 
-    assign sel_alu_src2[2] = 1'b0;  // 位2：选择常数8作为源2（当前未使用，可能用于调整栈指针）
+    // [1] = 1: 读 HI
+    assign lo_hi_r[1] = inst_mfhi;
 
-    assign sel_alu_src2[3] = inst_ori;  // 位3：选择零扩展立即数（ori指令）
+    // =========================================================================
+    // 8. ALU 操作码生成 (ALU Opcode)
+    // =========================================================================
+    // 将不同指令归类到 ALU 的具体操作上
+    assign op_add = inst_addiu | inst_jal | inst_addu | inst_lw | inst_sw | inst_add | inst_addi | inst_bgezal | inst_bltzal
+          | inst_jalr | inst_lb | inst_lbu | inst_lh | inst_lhu | inst_sb | inst_sh | inst_lsa;
+    assign op_sub = inst_subu | inst_sub;
+    assign op_slt = inst_slt | inst_slti;
+    assign op_sltu = inst_sltu | inst_sltiu;
+    assign op_and = inst_and | inst_andi;
+    assign op_nor = inst_nor;
+    assign op_or = inst_ori | inst_or;
+    assign op_xor = inst_xor | inst_xori;
+    assign op_sll = inst_sll | inst_sllv;
+    assign op_srl = inst_srl | inst_srlv;
+    assign op_sra = inst_sra | inst_srav ;
+    assign op_lui = inst_lui;
 
-
-
-    // ALU操作类型赋值 - 根据指令类型设置相应的ALU操作
-    assign op_add = inst_addiu;  // addiu指令需要加法操作
-    assign op_sub = 1'b0;        // 减法操作（当前未使用）
-    assign op_slt = 1'b0;        // 小于置位操作（当前未使用）
-    assign op_sltu = 1'b0;       // 无符号小于置位操作（当前未使用）
-    assign op_and = 1'b0;        // 与操作（当前未使用）
-    assign op_nor = 1'b0;        // 或非操作（当前未使用）
-    assign op_or = inst_ori;     // ori指令需要或操作
-    assign op_xor = 1'b0;        // 异或操作（当前未使用）
-    assign op_sll = 1'b0;        // 逻辑左移操作（当前未使用）
-    assign op_srl = 1'b0;        // 逻辑右移操作（当前未使用）
-    assign op_sra = 1'b0;        // 算术右移操作（当前未使用）
-    assign op_lui = inst_lui;    // lui指令需要加载高位操作
-
-    // 构建12位ALU操作控制信号
-    // alu_op格式：{op_add, op_sub, op_slt, op_sltu, op_and, op_nor, op_or, op_xor, op_sll, op_srl, op_sra, op_lui}
+    // 打包 ALU 操作码
     assign alu_op = {op_add, op_sub, op_slt, op_sltu,
                      op_and, op_nor, op_or, op_xor,
                      op_sll, op_srl, op_sra, op_lui};
 
 
+    // =========================================================================
+    // 9. 数据存储器控制信号 (Data RAM Control)
+    // =========================================================================
+    // 访存使能：Load 或 Store 指令
+    assign data_ram_en = inst_lw | inst_sw | inst_lb | inst_lbu | inst_lh | inst_lhu | inst_sb | inst_sh;
 
-    // 数据存储器控制信号赋值
-    // load and store enable
-    assign data_ram_en = 1'b0;   // 数据存储器使能信号，当前未使用加载/存储指令，设为0
+    // 写使能：Store指令为全1(1111)，否则为0
+    assign data_ram_wen = inst_sw ? 4'b1111 : 4'b0000;
 
-    // write enable
-    assign data_ram_wen = 1'b0;  // 数据存储器写使能信号，当前未使用存储指令，设为0
+    // 读模式控制：决定是读字节、半字还是字
+    assign data_ram_read    =  inst_lw  ? 4'b1111 :
+                               inst_lb  ? 4'b0001 :
+                               inst_lbu ? 4'b0010 :
+                               inst_lh  ? 4'b0011 :
+                               inst_lhu ? 4'b0100 :
+                               inst_sb  ? 4'b0101 :
+                               inst_sh  ? 4'b0111 :
+                               4'b0000;
+
+    // =========================================================================
+    // 10. 寄存器堆写控制 (Regfile Write Control)
+    // =========================================================================
+    // 寄存器写使能：所有需要写回通用寄存器的指令
+    assign rf_we = inst_ori | inst_lui | inst_addiu | inst_subu | inst_jal |inst_addu | inst_sll | inst_or | inst_xor | inst_lw | inst_sltu
+      | inst_slt | inst_slti | inst_sltiu | inst_add | inst_addi | inst_sub | inst_and | inst_andi | inst_nor | inst_sllv | inst_xori | inst_sra
+      | inst_srav | inst_srl | inst_srlv | inst_bgezal | inst_bltzal | inst_jalr  | inst_mfhi | inst_mflo | inst_lb | inst_lbu | inst_lh | inst_lhu | inst_lsa;
 
 
+    // 目标寄存器选择 (Destination Register Selection)
+    // [0] = 1: 写入 rd (R型指令)
+    assign sel_rf_dst[0] = inst_subu | inst_addu | inst_sll | inst_or | inst_xor | inst_sltu | inst_slt | inst_add | inst_sub | inst_and | inst_nor
+                             | inst_sllv | inst_sra | inst_srav | inst_srl | inst_srlv | inst_jalr | inst_mflo | inst_mfhi | inst_lsa;
+    // [1] = 1: 写入 rt (I型指令)
+    assign sel_rf_dst[1] = inst_ori | inst_lui | inst_addiu | inst_lw | inst_slti | inst_sltiu | inst_addi | inst_andi | inst_xori | inst_lb | inst_lbu | inst_lh | inst_lhu;
+    // [2] = 1: 写入 $31 (ra) (JAL等指令)
+    assign sel_rf_dst[2] = inst_jal | inst_bgezal | inst_bltzal ;
 
-    // 寄存器文件写使能信号 - 判断哪些指令需要写回寄存器
-    // regfile store enable
-    assign rf_we = inst_ori | inst_lui | inst_addiu;  // ori、lui、addiu指令需要写回结果到寄存器
+    // HI/LO 写信号生成
+    assign lo_hi_w[0] = inst_mtlo; // 写 LO
+    assign lo_hi_w[1] = inst_mthi; // 写 HI
 
+    // 确定最终的寄存器写地址 rf_waddr
+    assign rf_waddr = {5{sel_rf_dst[0]}} & rd
+                    | {5{sel_rf_dst[1]}} & rt
+                    | {5{sel_rf_dst[2]}} & 32'd31;
 
+    // 写回数据来源选择：1表示来自内存加载的数据(Load)，0表示来自ALU计算结果
+    assign sel_rf_res = (inst_lw | inst_lb | inst_lbu) ? 1'b1 : 1'b0;
 
-    // 目标寄存器选择逻辑 - 决定将结果写入哪个寄存器
-    // sel_rf_dst格式：[2:0]，3位选择信号
-    // store in [rd] - R型指令的目标寄存器
-    assign sel_rf_dst[0] = 1'b0;  // 当前未使用R型指令，设为0
-    
-    // store in [rt] - I型指令的目标寄存器
-    assign sel_rf_dst[1] = inst_ori | inst_lui | inst_addiu;  // ori、lui、addiu指令使用rt作为目标寄存器
-    
-    // store in [31] - 寄存器31（通常用于链接寄存器）
-    assign sel_rf_dst[2] = 1'b0;  // 当前未使用链接指令，设为0
+    // (被注释掉的代码块，可能用于LSA指令的逻辑)
+//    wire [2:0] zuoyi;
+//    assign zuoyi = inst_lsa ? (inst[7:6] + 1'b1) :  3'b0;
+//    assign ...
 
-    // 目标寄存器地址计算 - 根据选择信号决定最终写入哪个寄存器
-    // sel for regfile address
-    assign rf_waddr = {5{sel_rf_dst[0]}} & rd   // 如果选择rd，则使用rd字段
-                    | {5{sel_rf_dst[1]}} & rt   // 如果选择rt，则使用rt字段
-                    | {5{sel_rf_dst[2]}} & 32'd31;  // 如果选择31号寄存器，则使用31
-
-    // 寄存器写入数据源选择 - 决定写入寄存器的数据来源
-    // 0 from alu_res ; 1 from ld_res
-    assign sel_rf_res = 1'b0;  // 0: 来自ALU结果，1: 来自内存加载结果。当前只使用ALU结果 
-
-    // ID到EX阶段总线信号构建 - 将ID阶段的所有控制信号和数据打包
-    // id_to_ex_bus总线格式（159位）：
+    // =========================================================================
+    // 11. ID 到 EX 总线打包 (Bus Packing)
+    // =========================================================================
     assign id_to_ex_bus = {
-        id_pc,          // 158:127 - 当前指令的PC值（32位）
-        inst,           // 126:95  - 当前指令（32位）
-        rf_we,          // 94      - 寄存器写使能信号（1位）
-        rf_waddr,       // 93:89   - 目标寄存器地址（5位）
-        rdata1,         // 88:57   - 源寄存器1的数据（32位）
-        rdata2,         // 56:25   - 源寄存器2的数据（32位）
-        alu_op,         // 24:13   - ALU操作类型（12位）
-        sel_alu_src1,   // 12:10   - ALU第一个操作数源选择（3位）
-        sel_alu_src2,   // 9:7     - ALU第二个操作数源选择（3位）
-        data_ram_en,    // 6       - 数据存储器使能信号（1位）
-        data_ram_wen,   // 5:2     - 数据存储器写使能信号（4位）
-        sel_rf_res      // 1:0     - 寄存器写入数据源选择（2位）
+        id_pc,          // 158:127 PC值
+        inst,           // 126:95  指令码
+        alu_op,         // 94:83   ALU操作码
+        sel_alu_src1,   // 82:80   源操作数1选择
+        sel_alu_src2,   // 79:76   源操作数2选择
+        data_ram_en,    // 75      内存使能
+        data_ram_wen,   // 74:71   内存写使能
+        rf_we,          // 70      寄存器写使能
+        rf_waddr,       // 69:65   寄存器写地址
+        sel_rf_res,     // 64      写回数据来源选择
+        rdata1,         // 63:32   源操作数1数据
+        rdata2,         // 31:0    源操作数2数据
+        lo_hi_r,        // HI/LO读信号
+        lo_hi_w,        // HI/LO写信号
+        lo_o,           // LO数据
+        hi_o,           // HI数据
+        data_ram_read   // 内存读模式
     };
 
+//    assign id_to_ex_2 = ... (注释掉)
 
-    wire br_e;
-    wire [31:0] br_addr;
-    wire rs_eq_rt;
-    wire rs_ge_z;
-    wire rs_gt_z;
-    wire rs_le_z;
-    wire rs_lt_z;
-    wire [31:0] pc_plus_4;
+    // =========================================================================
+    // 12. 分支跳转逻辑 (Branch Logic)
+    // =========================================================================
+    wire br_e;              // 分支跳转使能
+    wire [31:0] br_addr;    // 分支跳转目标地址
+    wire rs_eq_rt;          // rs == rt
+    wire rs_ge_z;           // rs >= 0 (未完全定义)
+    wire rs_gt_z;           // rs > 0 (未完全定义)
+    wire rs_le_z;           // rs <= 0 (未完全定义)
+    wire rs_lt_z;           // rs < 0 (未完全定义)
+    wire [31:0] pc_plus_4;  // 当前PC + 4 (延迟槽之后的地址)
+    wire re_bne_rt;         // rs != rt
+//    wire [31:0] pc_plus_8; // (注释掉)
+
     assign pc_plus_4 = id_pc + 32'h4;
+//    assign pc_plus_8 = id_pc + 32'h8;
 
-    assign rs_eq_rt = (rdata1 == rdata2);
+    // 分支条件判断 (注意：这里直接使用有符号位的最高位判断正负)
+    assign rs_eq_rt = (rdata1 == rdata2);           // 相等
+    assign re_bne_rt = (rdata1 != rdata2);          // 不等
+    assign re_bgez_rt = (rdata1[31] == 1'b0);       // >= 0 (符号位为0)
+    assign re_bltz_rt = (rdata1[31] == 1'b1);       // < 0 (符号位为1)
+    assign re_blez_rt = (rdata1[31] == 1'b1 || rdata1 == 32'b0); // <= 0
+    assign re_bgtz_rt = (rdata1[31] == 1'b0 && rdata1 != 32'b0); // > 0
 
-    assign br_e = inst_beq & rs_eq_rt;
-    assign br_addr = inst_beq ? (pc_plus_4 + {{14{inst[15]}},inst[15:0],2'b0}) : 32'b0;
+    // 分支使能信号生成：如果是分支指令且满足条件，或者直接跳转指令
+    assign br_e = (inst_beq && rs_eq_rt) | inst_jr | inst_jal | (inst_bne && re_bne_rt) | inst_j |(inst_bgez && re_bgez_rt)
+                      | (inst_bltz && re_bltz_rt) |(inst_bgtz && re_bgtz_rt) | (inst_blez && re_blez_rt) | (inst_bgezal && re_bgez_rt)
+                      | (inst_bltzal && re_bltz_rt) | inst_jalr;
 
+    // 跳转地址生成逻辑
+    assign br_addr = inst_beq ? (pc_plus_4 + {{14{inst[15]}},inst[15:0],2'b0}) : // BEQ: PC+4 + offset<<2
+    inst_jr ? (rdata1) :                                                          // JR: rs寄存器值
+    inst_jal ? ({pc_plus_4[31:28],inst[25:0],2'b0}):                              // JAL: (PC+4)[31:28] | index<<2
+    inst_bne ? (pc_plus_4 + {{14{inst[15]}},inst[15:0],2'b0}) :                   // BNE
+    inst_bgez ? (pc_plus_4 + {{14{inst[15]}},inst[15:0],2'b0}) :                  // BGEZ
+    inst_bgtz ? (pc_plus_4 + {{14{inst[15]}},inst[15:0],2'b0}) :                  // BGTZ
+    inst_bltz ? (pc_plus_4 + {{14{inst[15]}},inst[15:0],2'b0}) :                  // BLTZ
+    inst_blez ? (pc_plus_4 + {{14{inst[15]}},inst[15:0],2'b0}) :                  // BLEZ
+    inst_bgezal ? (pc_plus_4 + {{14{inst[15]}},inst[15:0],2'b0}) :                // BGEZAL
+    inst_bltzal ? (pc_plus_4 + {{14{inst[15]}},inst[15:0],2'b0}) :                // BLTZAL
+    inst_j   ?  ({pc_plus_4[31:28],inst[25:0],2'b0}):                             // J
+    inst_jalr ? (rdata1) :                                                        // JALR
+    32'b0;
+
+    // assign id_pc = inst_jal ? pc_plus_8 : id_pc; (注释掉)
+
+    // 打包分支信息输出
     assign br_bus = {
         br_e,
         br_addr
     };
-    
 
-
-endmodule  // ID模块结束
+endmodule
