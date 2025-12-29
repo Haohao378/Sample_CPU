@@ -10,3 +10,4 @@ module fa (
   assign t1 = b&cin;
   assign c = t1|t2|t3;
 endmodule
+//
