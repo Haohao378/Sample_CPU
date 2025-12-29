@@ -4,7 +4,7 @@ module add (
   input wire [64:0] inc,
   output wire [64:0] s,
   output wire [64:0] c
-);
+);//
   assign c[0] = 1'b0;
   wire ov;
   fa bit0 (.a(ina[ 0]), .b(inb[ 0]), .cin(inc[ 0]), .s(s[ 0]), .c(c[ 1]));
